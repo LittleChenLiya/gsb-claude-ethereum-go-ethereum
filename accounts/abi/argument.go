@@ -87,6 +87,35 @@ func (arguments Arguments) Unpack(data []byte) ([]any, error) {
 	return arguments.UnpackValues(data)
 }
 
+// UnpackWithRemaining performs the operation hexdata -> Go format, just like
+// Unpack, and additionally returns the number of trailing bytes that were not
+// consumed while decoding the arguments. A zero remainder means that the
+// input was consumed exactly.
+//
+// The decoding and the consumed-size computation share the same boundary
+// checks: a truncated dynamic parameter (missing length word or tail bytes)
+// still produces an error instead of partially decoded values.
+func (arguments Arguments) UnpackWithRemaining(data []byte) ([]any, int, error) {
+	if len(data) == 0 {
+		if len(arguments.NonIndexed()) != 0 {
+			return nil, 0, errors.New("abi: attempting to unmarshal an empty string while arguments are expected")
+		}
+		return make([]any, 0), 0, nil
+	}
+	unpacked, err := arguments.UnpackValues(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	consumed, err := arguments.encodedSize(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	if consumed > len(data) {
+		return nil, 0, fmt.Errorf("abi: decoded %d bytes from input of length %d", consumed, len(data))
+	}
+	return unpacked, len(data) - consumed, nil
+}
+
 // UnpackIntoMap performs the operation hexdata -> mapping of argument name to argument value.
 func (arguments Arguments) UnpackIntoMap(v map[string]any, data []byte) error {
 	// Make sure map is not nil

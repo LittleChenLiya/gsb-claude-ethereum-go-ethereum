@@ -113,6 +113,22 @@ func (abi ABI) Unpack(name string, data []byte) ([]interface{}, error) {
 	return args.Unpack(data)
 }
 
+// UnpackWithRemaining works like Unpack, but additionally reports the number
+// of trailing bytes in data that were not consumed while decoding the
+// arguments. It allows callers to detect data that carries more bytes than
+// the abi specification requires (e.g. trailing garbage).
+//
+// Decoding is performed with the exact same rules as Unpack: malformed or
+// truncated input results in an error and no partially decoded values, even
+// when the missing bytes belong to a dynamic parameter located in the tail.
+func (abi ABI) UnpackWithRemaining(name string, data []byte) ([]interface{}, int, error) {
+	args, err := abi.getArguments(name, data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return args.UnpackWithRemaining(data)
+}
+
 // UnpackIntoInterface unpacks the output in v according to the abi specification.
 // It performs an additional copy. Please only use, if you want to unpack into a
 // structure that does not strictly conform to the abi structure (e.g. has additional arguments)
