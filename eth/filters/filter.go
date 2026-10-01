@@ -19,6 +19,7 @@ package filters
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"slices"
@@ -33,6 +34,45 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
+var (
+	// ErrCursorNotSupported is returned by Cursor if the filter is not a block
+	// range filter. Single block filters always return their full result set and
+	// therefore cannot carry a resumable scan cursor.
+	ErrCursorNotSupported = errors.New("cursor snapshot is only supported for block range filters")
+	// ErrCursorNotEnabled is returned by Cursor if the filter has not been
+	// initialized with a cursor snapshot (see NewRangeFilterWithCursor or
+	// SetCursor). Filters without an enabled cursor always rescan the full
+	// requested block range.
+	ErrCursorNotEnabled = errors.New("cursor snapshot is not enabled")
+	// ErrInvalidCursor is returned when a cursor snapshot cannot be resumed
+	// either because its fields are inconsistent/out of range or because the
+	// block that it points to is no longer available in the chain.
+	ErrInvalidCursor = errors.New("invalid log filter cursor")
+)
+
+// CursorSnapshot is a resumable scan position for a block range log filter.
+//
+// NextBlock is the number of the first block that has not been fully scanned,
+// i.e. scanning resumes at this block. LastBlockHash is the hash of block
+// NextBlock-1 (the last block that was fully scanned). A zero LastBlockHash
+// marks a fresh start position that is not anchored to any previously scanned
+// block; such a snapshot is only valid when NextBlock points at the beginning
+// of the filter range. After every successful Logs call the snapshot is
+// advanced to cover the scanned blocks.
+//
+// On resume, LastBlockHash is compared against the current chain: if the
+// anchored block has been reorged away, the cursor is rolled back to the
+// common ancestor of the old and the new chain so that no block of the new
+// chain is skipped. If the anchored block cannot be found at all,
+// ErrInvalidCursor is returned.
+//
+// CursorSnapshot is a value type safe to copy; it is meant for in-process
+// persistence (the block hashes reference the local chain database).
+type CursorSnapshot struct {
+	NextBlock     uint64
+	LastBlockHash common.Hash
+}
+
 // Filter can be used to retrieve and filter logs.
 type Filter struct {
 	sys *FilterSystem
@@ -42,6 +82,10 @@ type Filter struct {
 
 	block      *common.Hash // Block hash if filtering a single block
 	begin, end int64        // Range interval if filtering multiple blocks
+
+	// cursor holds the resumable scan position of a range filter. It is nil
+	// unless cursor tracking has been enabled explicitly.
+	cursor *CursorSnapshot
 
 	rangeLogsTestHook chan rangeLogsTestEvent
 	rangeLimit        uint64
@@ -56,6 +100,17 @@ func (sys *FilterSystem) NewRangeFilter(begin, end int64, addresses []common.Add
 	filter.end = end
 	filter.rangeLimit = rangeLimit
 
+	return filter
+}
+
+// NewRangeFilterWithCursor creates a block range filter with cursor tracking
+// enabled and an initial scan position taken from cursor. Note that the
+// consistency of cursor with the filter range and the underlying chain is
+// checked when Logs is called; see CursorSnapshot for the snapshot semantics.
+func (sys *FilterSystem) NewRangeFilterWithCursor(begin, end int64, addresses []common.Address, topics [][]common.Hash, rangeLimit uint64, cursor CursorSnapshot) *Filter {
+	filter := sys.NewRangeFilter(begin, end, addresses, topics, rangeLimit)
+	c := cursor
+	filter.cursor = &c
 	return filter
 }
 
@@ -76,6 +131,59 @@ func newFilter(sys *FilterSystem, addresses []common.Address, topics [][]common.
 		addresses: addresses,
 		topics:    topics,
 	}
+}
+
+// Cursor returns a snapshot of the filter's current scan position. The
+// returned snapshot can be passed to a newly created range filter (via
+// NewRangeFilterWithCursor or SetCursor) within the same process in order to
+// resume the scan without reprocessing old blocks.
+//
+// It returns ErrCursorNotSupported for single block filters and
+// ErrCursorNotEnabled for range filters whose cursor tracking was not enabled.
+func (f *Filter) Cursor() (CursorSnapshot, error) {
+	if f.block != nil {
+		return CursorSnapshot{}, ErrCursorNotSupported
+	}
+	if f.cursor == nil {
+		return CursorSnapshot{}, ErrCursorNotEnabled
+	}
+	return *f.cursor, nil
+}
+
+// SetCursor enables cursor tracking on the filter and sets its scan position.
+// It can also be used to replace the cursor of an existing filter. The
+// consistency of cursor with the filter range and the underlying chain is
+// checked when Logs is called; see CursorSnapshot for the snapshot semantics.
+func (f *Filter) SetCursor(cursor CursorSnapshot) error {
+	if f.block != nil {
+		return ErrCursorNotSupported
+	}
+	if err := validateCursorShape(cursor); err != nil {
+		return err
+	}
+	c := cursor
+	f.cursor = &c
+	return nil
+}
+
+// validateCursorShape performs the chain-independent structural validation of
+// a cursor snapshot.
+func validateCursorShape(cursor CursorSnapshot) error {
+	// NextBlock == 0 implies that the last scanned block would be number -1,
+	// which is impossible, so an anchor hash is not allowed here.
+	if cursor.NextBlock == 0 {
+		if cursor.LastBlockHash != (common.Hash{}) {
+			return fmt.Errorf("%w: next block 0 cannot be anchored to a scanned block", ErrInvalidCursor)
+		}
+		return nil
+	}
+	// An unanchored snapshot (zero hash) is only accepted as a fresh start
+	// marker. Any resumed snapshot must carry the hash of the last scanned
+	// block so that reorgs can be detected and handled.
+	if cursor.LastBlockHash == (common.Hash{}) && cursor.NextBlock != 0 {
+		return fmt.Errorf("%w: next block %d is not anchored to the hash of the last scanned block", ErrInvalidCursor, cursor.NextBlock)
+	}
+	return nil
 }
 
 // Logs searches the blockchain for matching log entries, returning all from the
@@ -148,7 +256,126 @@ func (f *Filter) Logs(ctx context.Context) ([]*types.Log, error) {
 	if f.rangeLimit != 0 && (end-begin) > f.rangeLimit {
 		return nil, invalidParamsErr("exceed maximum block range %d", f.rangeLimit)
 	}
+	if f.cursor != nil {
+		// Adjust the start of the scan to the resumed cursor position. This
+		// also validates the snapshot against the current chain, rolling it
+		// back past a reorg or returning ErrInvalidCursor.
+		begin, err = f.resolveCursor(ctx, begin, end)
+		if err != nil {
+			return nil, err
+		}
+		// An open-ended ("latest") range ends at the current head. Resolve it
+		// here in order to detect a caught-up cursor without scanning.
+		scanEnd := end
+		if scanEnd == math.MaxUint64 {
+			head := f.sys.backend.CurrentHeader()
+			if head == nil {
+				return nil, errors.New("head block not available")
+			}
+			scanEnd = head.Number.Uint64()
+		}
+		if begin > scanEnd {
+			// The cursor has already covered the entire requested range (for
+			// an open-ended filter this means the chain head has not
+			// advanced). Nothing new to scan and the cursor stays unchanged.
+			return []*types.Log{}, nil
+		}
+	}
 	return f.rangeLogs(ctx, begin, end)
+}
+
+// resolveCursor validates the cursor snapshot against the requested block
+// range and the current chain and returns the block number at which scanning
+// should resume.
+//
+// The returned number is always within [rangeBegin, rangeEnd]. If the block
+// anchored by the cursor has been reorged away, the snapshot is rolled back
+// to the first block after the common ancestor of the old and the new chain
+// so that blocks of the new chain are never skipped. If the snapshot is
+// inconsistent with the filter range or its anchor block cannot be found in
+// the chain at all, ErrInvalidCursor is returned.
+func (f *Filter) resolveCursor(ctx context.Context, rangeBegin, rangeEnd uint64) (uint64, error) {
+	cursor := *f.cursor
+	if err := validateCursorShape(cursor); err != nil {
+		return 0, err
+	}
+	// A cursor positioned before the requested range can never resume it:
+	// accepting such a snapshot would silently skip blocks.
+	if cursor.NextBlock < rangeBegin {
+		return 0, fmt.Errorf("%w: cursor block %d is before the requested range beginning at block %d", ErrInvalidCursor, cursor.NextBlock, rangeBegin)
+	}
+	// Resolve the actual end of an open-ended ("latest") range in order to be
+	// able to tell a caught-up cursor (at the chain head) apart from one that
+	// points beyond the known chain.
+	head := f.sys.backend.CurrentHeader()
+	if head == nil {
+		return 0, errors.New("head block not available")
+	}
+	actualEnd := rangeEnd
+	if actualEnd == math.MaxUint64 {
+		actualEnd = head.Number.Uint64()
+	}
+	if cursor.NextBlock > actualEnd+1 {
+		return 0, fmt.Errorf("%w: cursor block %d points beyond the last available block %d", ErrInvalidCursor, cursor.NextBlock, actualEnd)
+	}
+
+	// A fresh, unanchored start marker (zero hash) needs no chain checks.
+	if cursor.LastBlockHash == (common.Hash{}) {
+		return cursor.NextBlock, nil
+	}
+
+	// Verify the block that the snapshot claims to have scanned last. If the
+	// header is missing or its number does not match the snapshot, the
+	// snapshot cannot be resumed.
+	anchorNum := cursor.NextBlock - 1
+	anchor, err := f.sys.backend.HeaderByHash(ctx, cursor.LastBlockHash)
+	if err != nil {
+		return 0, fmt.Errorf("%w: failed to retrieve anchor block: %v", ErrInvalidCursor, err)
+	}
+	if anchor == nil || anchor.Number.Uint64() != anchorNum {
+		return 0, fmt.Errorf("%w: anchor block %s (number %d) not found in chain", ErrInvalidCursor, cursor.LastBlockHash.TerminalString(), anchorNum)
+	}
+
+	// If the anchor is still the canonical block at its number, the snapshot
+	// is consistent and scanning can continue right after it.
+	current := f.sys.backend.CurrentView()
+	if current == nil {
+		return 0, errors.New("head block not available")
+	}
+	if anchorNum <= current.HeadNumber() && current.BlockHash(anchorNum) == cursor.LastBlockHash {
+		return cursor.NextBlock, nil
+	}
+
+	// The anchor is not canonical anymore: a reorg happened. Walk the old
+	// chain back to its common ancestor with the current chain and resume
+	// scanning at the first block after it, so that none of the new chain's
+	// blocks get skipped.
+	var (
+		num      = anchorNum
+		hash     = cursor.LastBlockHash // old block at num
+		ancestor uint64                 // highest shared block number
+	)
+	for {
+		if num <= current.HeadNumber() && current.BlockHash(num) == hash {
+			ancestor = num
+			break
+		}
+		if num == 0 {
+			return 0, fmt.Errorf("%w: cursor anchor %s shares no history with the current chain", ErrInvalidCursor, cursor.LastBlockHash.TerminalString())
+		}
+		header, err := f.sys.backend.HeaderByHash(ctx, hash)
+		if err != nil {
+			return 0, fmt.Errorf("%w: failed to walk back to common ancestor: %v", ErrInvalidCursor, err)
+		}
+		if header == nil {
+			return 0, fmt.Errorf("%w: reorged anchor block %s is not available in chain", ErrInvalidCursor, cursor.LastBlockHash.TerminalString())
+		}
+		num--
+		hash = header.ParentHash
+	}
+	// If the chains already diverged before the requested range, the whole
+	// range has to be rescanned.
+	return max(ancestor+1, rangeBegin), nil
 }
 
 const (
@@ -411,6 +638,24 @@ func (f *Filter) rangeLogs(ctx context.Context, firstBlock, lastBlock uint64) ([
 		}
 		if f.rangeLogsTestHook != nil && session.matchRange != mr {
 			f.rangeLogsTestHook <- rangeLogsTestEvent{rangeLogsTestReorg, session.matchRange}
+		}
+	}
+	// Advance the cursor over the fully scanned range so that a rebuilt filter
+	// resumes at the next block. The anchor hash is taken from the final chain
+	// view, which also detects a reorg that trimmed results during the scan.
+	if f.cursor != nil {
+		scanned := session.matchRange
+		if scanned.IsEmpty() {
+			return session.matches, nil
+		}
+		lastNumber := scanned.Last()
+		lastHash := session.chainView.BlockHash(lastNumber)
+		if lastHash == (common.Hash{}) {
+			return nil, fmt.Errorf("%w: scanned block %d is not available in chain view", ErrInvalidCursor, lastNumber)
+		}
+		f.cursor = &CursorSnapshot{
+			NextBlock:     scanned.AfterLast(),
+			LastBlockHash: lastHash,
 		}
 	}
 	return session.matches, nil
