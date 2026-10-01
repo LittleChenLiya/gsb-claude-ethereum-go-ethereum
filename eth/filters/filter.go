@@ -19,6 +19,7 @@ package filters
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"slices"
@@ -45,6 +46,24 @@ type Filter struct {
 
 	rangeLogsTestHook chan rangeLogsTestEvent
 	rangeLimit        uint64
+
+	// cursor tracks the next block to scan for range filters. It is updated
+	// by rangeLogs after a successful scan and used by Snapshot to produce a
+	// resumable cursor. A nil cursor means no scan has been performed yet.
+	cursor *logFilterCursor
+}
+
+// logFilterCursor records the scan progress of a range filter.
+type logFilterCursor struct {
+	// nextBlock is the number of the next block that has not been scanned.
+	nextBlock uint64
+	// blockHash is the hash of the last scanned block (nextBlock-1). It is
+	// used to detect chain reorgs when the cursor is restored.
+	blockHash common.Hash
+	// resolvedBegin is the resolved begin block number of the filter's range.
+	// It is used as the lower bound when walking back the chain to find the
+	// fork point after a reorg.
+	resolvedBegin uint64
 }
 
 // NewRangeFilter creates a new filter which uses a bloom filter on blocks to
@@ -57,6 +76,60 @@ func (sys *FilterSystem) NewRangeFilter(begin, end int64, addresses []common.Add
 	filter.rangeLimit = rangeLimit
 
 	return filter
+}
+
+// NewRangeFilterFromSnapshot creates a new range filter and restores its scan
+// cursor from the given snapshot.
+//
+// The snapshot is validated against the current chain state. If a chain reorg
+// is detected below the cursor (the hash of the last scanned block no longer
+// matches the canonical chain), the scan range is rewound to the fork point so
+// that the affected blocks are re-scanned instead of skipped. If the snapshot
+// is invalid (e.g. the cursor block can no longer be found in the chain because
+// it has been pruned), an error is returned.
+func (sys *FilterSystem) NewRangeFilterFromSnapshot(snap *LogFilterSnapshot) (*Filter, error) {
+	if snap == nil {
+		return nil, errors.New("log filter snapshot is nil")
+	}
+	// If no scan has been performed yet, fall back to a fresh filter with the
+	// original range.
+	if snap.nextBlock == 0 {
+		return sys.NewRangeFilter(snap.begin, snap.end, snap.addresses, snap.topics, snap.rangeLimit), nil
+	}
+
+	ctx := context.Background()
+
+	// Validate the cursor against the current chain. Walk back from the last
+	// scanned block, comparing the snapshot's block hashes with the canonical
+	// chain, until a matching block is found (the fork point) or the range
+	// begin is reached.
+	forkPoint := int64(snap.resolvedBegin) - 1
+	snapHash := snap.blockHash
+	for n := int64(snap.nextBlock) - 1; n >= int64(snap.resolvedBegin); n-- {
+		canonicalHdr, err := sys.backend.HeaderByNumber(ctx, rpc.BlockNumber(n))
+		if err != nil {
+			return nil, err
+		}
+		if canonicalHdr != nil && canonicalHdr.Hash() == snapHash {
+			forkPoint = n
+			break
+		}
+		// Move the snapshot cursor to the parent block.
+		snapHdr, err := sys.backend.HeaderByHash(ctx, snapHash)
+		if err != nil {
+			return nil, err
+		}
+		if snapHdr == nil {
+			return nil, fmt.Errorf("log filter snapshot invalid: cursor block %#x at position %d not found in chain", snapHash, n)
+		}
+		snapHash = snapHdr.ParentHash
+	}
+
+	resumeBegin := forkPoint + 1
+	if resumeBegin < int64(snap.resolvedBegin) {
+		resumeBegin = int64(snap.resolvedBegin)
+	}
+	return sys.NewRangeFilter(resumeBegin, snap.end, snap.addresses, snap.topics, snap.rangeLimit), nil
 }
 
 // NewBlockFilter creates a new filter which directly inspects the contents of
@@ -76,6 +149,56 @@ func newFilter(sys *FilterSystem, addresses []common.Address, topics [][]common.
 		addresses: addresses,
 		topics:    topics,
 	}
+}
+
+// LogFilterSnapshot is a resumable cursor for a range log filter.
+//
+// It records the filter criteria together with the next block position that
+// has not been scanned yet. A snapshot can be taken after a Filter.Logs call
+// and used to resume scanning later within the same process via
+// FilterSystem.NewRangeFilterFromSnapshot.
+//
+// The snapshot also records the hash of the last scanned block so that a chain
+// reorg can be detected when the snapshot is restored: if the canonical chain
+// no longer contains that block at the same position, the scan range is rewound
+// to the fork point instead of skipping the affected blocks. If the cursor
+// block can no longer be found in the chain (e.g. it has been pruned), the
+// snapshot is considered invalid and an error is returned.
+type LogFilterSnapshot struct {
+	// filter configuration
+	addresses  []common.Address
+	topics     [][]common.Hash
+	begin      int64
+	end        int64
+	rangeLimit uint64
+
+	// cursor; a zero nextBlock means no scan has been performed yet.
+	nextBlock     uint64
+	blockHash     common.Hash // hash of the last scanned block (nextBlock-1)
+	resolvedBegin uint64     // resolved begin block number (lower bound for reorg walk-back)
+}
+
+// Snapshot returns a resumable cursor for the filter.
+//
+// For range filters the cursor records the next block that has not been
+// scanned yet. If no scan has been performed the cursor starts at the
+// filter's begin block. The returned snapshot can be passed to
+// FilterSystem.NewRangeFilterFromSnapshot to resume scanning later within the
+// same process.
+func (f *Filter) Snapshot() *LogFilterSnapshot {
+	snap := &LogFilterSnapshot{
+		addresses:  f.addresses,
+		topics:     f.topics,
+		begin:      f.begin,
+		end:        f.end,
+		rangeLimit: f.rangeLimit,
+	}
+	if f.cursor != nil {
+		snap.nextBlock = f.cursor.nextBlock
+		snap.blockHash = f.cursor.blockHash
+		snap.resolvedBegin = f.cursor.resolvedBegin
+	}
+	return snap
 }
 
 // Logs searches the blockchain for matching log entries, returning all from the
@@ -101,47 +224,12 @@ func (f *Filter) Logs(ctx context.Context) ([]*types.Log, error) {
 		return nil, errPendingLogsUnsupported
 	}
 
-	resolveSpecial := func(number int64) (uint64, error) {
-		switch number {
-		case rpc.LatestBlockNumber.Int64():
-			// when searching from and/or until the current head, we resolve it
-			// to MaxUint64 which is translated by rangeLogs to the actual head
-			// in each iteration, ensuring that the head block will be searched
-			// even if the chain is updated during search.
-			return math.MaxUint64, nil
-		case rpc.FinalizedBlockNumber.Int64():
-			hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.FinalizedBlockNumber)
-			if hdr == nil {
-				return 0, errors.New("finalized header not found")
-			}
-			return hdr.Number.Uint64(), nil
-		case rpc.SafeBlockNumber.Int64():
-			hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.SafeBlockNumber)
-			if hdr == nil {
-				return 0, errors.New("safe header not found")
-			}
-			return hdr.Number.Uint64(), nil
-		case rpc.EarliestBlockNumber.Int64():
-			earliest := f.sys.backend.HistoryPruningCutoff()
-			hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.BlockNumber(earliest))
-			if hdr == nil {
-				return 0, errors.New("earliest header not found")
-			}
-			return hdr.Number.Uint64(), nil
-		default:
-			if number < 0 {
-				return 0, errors.New("negative block number")
-			}
-			return uint64(number), nil
-		}
-	}
-
 	// range query need to resolve the special begin/end block number
-	begin, err := resolveSpecial(f.begin)
+	begin, err := f.resolveBlockNumber(ctx, f.begin)
 	if err != nil {
 		return nil, err
 	}
-	end, err := resolveSpecial(f.end)
+	end, err := f.resolveBlockNumber(ctx, f.end)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +237,43 @@ func (f *Filter) Logs(ctx context.Context) ([]*types.Log, error) {
 		return nil, invalidParamsErr("exceed maximum block range %d", f.rangeLimit)
 	}
 	return f.rangeLogs(ctx, begin, end)
+}
+
+// resolveBlockNumber resolves a special block number (latest, finalized, safe,
+// earliest) to a concrete block number.
+func (f *Filter) resolveBlockNumber(ctx context.Context, number int64) (uint64, error) {
+	switch number {
+	case rpc.LatestBlockNumber.Int64():
+		// when searching from and/or until the current head, we resolve it
+		// to MaxUint64 which is translated by rangeLogs to the actual head
+		// in each iteration, ensuring that the head block will be searched
+		// even if the chain is updated during search.
+		return math.MaxUint64, nil
+	case rpc.FinalizedBlockNumber.Int64():
+		hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.FinalizedBlockNumber)
+		if hdr == nil {
+			return 0, errors.New("finalized header not found")
+		}
+		return hdr.Number.Uint64(), nil
+	case rpc.SafeBlockNumber.Int64():
+		hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.SafeBlockNumber)
+		if hdr == nil {
+			return 0, errors.New("safe header not found")
+		}
+		return hdr.Number.Uint64(), nil
+	case rpc.EarliestBlockNumber.Int64():
+		earliest := f.sys.backend.HistoryPruningCutoff()
+		hdr, _ := f.sys.backend.HeaderByNumber(ctx, rpc.BlockNumber(earliest))
+		if hdr == nil {
+			return 0, errors.New("earliest header not found")
+		}
+		return hdr.Number.Uint64(), nil
+	default:
+		if number < 0 {
+			return 0, errors.New("negative block number")
+		}
+		return uint64(number), nil
+	}
 }
 
 const (
@@ -412,6 +537,19 @@ func (f *Filter) rangeLogs(ctx context.Context, firstBlock, lastBlock uint64) ([
 		if f.rangeLogsTestHook != nil && session.matchRange != mr {
 			f.rangeLogsTestHook <- rangeLogsTestEvent{rangeLogsTestReorg, session.matchRange}
 		}
+	}
+	// Record the scan cursor so that a snapshot can be taken and the filter
+	// resumed later. The next block to scan is the first block after the
+	// fully searched range.
+	nextBlock := session.matchRange.AfterLast()
+	var blockHash common.Hash
+	if nextBlock > 0 {
+		blockHash = session.chainView.BlockId(nextBlock - 1)
+	}
+	f.cursor = &logFilterCursor{
+		nextBlock:     nextBlock,
+		blockHash:     blockHash,
+		resolvedBegin: firstBlock,
 	}
 	return session.matches, nil
 }
