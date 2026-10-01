@@ -156,6 +156,87 @@ func Sender(signer Signer, tx *Transaction) (common.Address, error) {
 	return addr, nil
 }
 
+// SigningDomain is the replay-protection domain a transaction signature is
+// bound to. It ties together the chain ID, the transaction type and the hash
+// that must be (or was) signed with the sender's private key.
+type SigningDomain struct {
+	ChainID *big.Int    // chain the signature is bound to; zero for unprotected legacy transactions
+	Type    uint8       // transaction type, see LegacyTxType ... SetCodeTxType
+	SigHash common.Hash // hash that is signed for this domain
+}
+
+// CheckSigningDomain verifies that the transaction belongs to the signature
+// domain of the given chain. It checks that:
+//
+//   - the transaction type is known and the type byte matches the inner
+//     transaction encoding,
+//   - the chain ID bound to the signature matches the expected chain ID,
+//     rejecting cross-chain replay attempts with ErrInvalidChainId,
+//   - and computes the hash that must be signed using the historical
+//     encodings: legacy transactions use the RLP preimage (EIP-155 for
+//     replay-protected transactions, plain RLP otherwise), typed
+//     transactions use their EIP-2718 type-prefixed preimage.
+//
+// Unprotected legacy transactions (pre-EIP-155) carry no chain ID and are
+// valid on every chain; they cannot be replay-protected and report a zero
+// chain ID.
+//
+// The returned domain's SigHash is the hash that must be signed for the
+// expected chain. A signature produced for another chain or another
+// transaction type recovers a different sender over that hash, so the chain
+// ID and type checks are what enforce replay protection on top of signature
+// recovery.
+func (tx *Transaction) CheckSigningDomain(chainID *big.Int) (SigningDomain, error) {
+	if chainID == nil {
+		chainID = new(big.Int)
+	}
+	if tx == nil || tx.inner == nil {
+		return SigningDomain{ChainID: new(big.Int)}, ErrTxTypeNotSupported
+	}
+	domain := SigningDomain{ChainID: new(big.Int), Type: tx.Type()}
+
+	// The type byte must match the inner transaction encoding and be a known
+	// transaction type.
+	if tx.inner.txType() != domain.Type {
+		return domain, fmt.Errorf("%w: type byte %d does not match inner encoding", ErrTxTypeNotSupported, domain.Type)
+	}
+	switch tx.inner.(type) {
+	case *LegacyTx, *AccessListTx, *DynamicFeeTx, *BlobTx, *SetCodeTx:
+	default:
+		return domain, fmt.Errorf("%w: unknown transaction type %d", ErrTxTypeNotSupported, domain.Type)
+	}
+
+	switch inner := tx.inner.(type) {
+	case *LegacyTx:
+		if tx.Protected() {
+			// Replay-protected legacy transactions derive the chain ID from V
+			// and sign the EIP-155 RLP preimage.
+			domain.ChainID.Set(tx.ChainId())
+			domain.SigHash = inner.sigHash(chainID)
+			if domain.ChainID.Cmp(chainID) != 0 {
+				return domain, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, domain.ChainID, chainID)
+			}
+		} else {
+			// Historical pre-EIP-155 encoding: plain RLP, no chain ID. The
+			// signature is valid on every chain, so there is no domain to
+			// check against.
+			domain.SigHash = FrontierSigner{}.Hash(tx)
+		}
+	default:
+		// Typed transactions (EIP-2718 and later) carry an explicit chain ID
+		// and sign the type-prefixed RLP preimage.
+		domain.ChainID.Set(tx.ChainId())
+		domain.SigHash = inner.sigHash(chainID)
+		if domain.ChainID.Sign() == 0 {
+			return domain, fmt.Errorf("%w: missing chain id in typed transaction", ErrInvalidChainId)
+		}
+		if domain.ChainID.Cmp(chainID) != 0 {
+			return domain, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, domain.ChainID, chainID)
+		}
+	}
+	return domain, nil
+}
+
 // Signer encapsulates transaction signature handling. The name of this type is slightly
 // misleading because Signers don't actually sign, they're just for validating and
 // processing of signatures.
