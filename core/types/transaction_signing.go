@@ -28,7 +28,139 @@ import (
 	"github.com/ethereum/go-ethereum/params/forks"
 )
 
-var ErrInvalidChainId = errors.New("invalid chain id for signer")
+var (
+	ErrInvalidChainId = errors.New("invalid chain id for signer")
+
+	// ErrSignatureDomain is the base error returned when the signature domain of a
+	// transaction does not match the domain of the signer it is checked against.
+	// Use errors.Is to distinguish the specific causes below.
+	ErrSignatureDomain = errors.New("signature domain mismatch")
+
+	// ErrSignatureDomainType indicates that the signer does not support the
+	// transaction's type, so its signature cannot belong to this domain.
+	ErrSignatureDomainType = fmt.Errorf("%w: transaction type not supported by signer", ErrSignatureDomain)
+
+	// ErrSignatureDomainChainID indicates that the chain ID embedded in the
+	// transaction does not match the signer's chain ID. Accepting such a
+	// transaction would allow cross-chain replay, so it must be rejected.
+	ErrSignatureDomainChainID = fmt.Errorf("%w: chain id mismatch", ErrSignatureDomain)
+
+	// ErrSignatureDomainHash indicates that the hash that was actually signed
+	// (as derived from the transaction contents) differs from the hash the
+	// signer expects. This catches, among other things, a signature produced for
+	// one transaction type being attached to a different type.
+	ErrSignatureDomainHash = fmt.Errorf("%w: signing hash mismatch", ErrSignatureDomain)
+)
+
+// SignatureDomain describes the signing domain of a transaction: the
+// combination of chain ID, transaction type and the hash that ought to be
+// signed. Two transactions only share a signature domain if all three fields
+// are identical. The signed hash alone is unique per domain, but exposing the
+// individual fields makes it possible to tell whether a rejection was caused
+// by a cross-chain replay (chain ID) or by a different transaction encoding
+// (type / signed hash).
+type SignatureDomain struct {
+	ChainID  *big.Int     // chain ID the transaction's signature is bound to (0 for unprotected legacy txs)
+	TxType   byte         // EIP-2718 transaction type (0x00 for legacy transactions)
+	SignedOn common.Hash  // hash of the transaction exactly as presented to the signer
+}
+
+// String renders a signature domain in a human readable form.
+func (d SignatureDomain) String() string {
+	return fmt.Sprintf("SignatureDomain{chainID: %v, type: %#x, signedHash: %s}", d.ChainID, d.TxType, d.SignedOn.Hex())
+}
+
+// signerSupportsType reports whether the signer can process the given
+// transaction type. The built-in signers (modernSigner and the legacy
+// frontier/homestead/eip155 signers) are inspected directly; external signer
+// implementations are assumed to support the type and are expected to reject
+// unsupported types themselves through Sender.
+func signerSupportsType(signer Signer, txType byte) bool {
+	switch s := signer.(type) {
+	case *modernSigner:
+		return s.supportsType(txType)
+	case EIP155Signer, HomesteadSigner, FrontierSigner:
+		return txType == LegacyTxType
+	default:
+		return true
+	}
+}
+
+// CheckSignatureDomain verifies that the signature domain of tx is consistent
+// with the domain represented by signer. It is a read-only entry point intended
+// to be called before recovering the sender: it does not touch the signature
+// itself, it only proves that the chain ID, the transaction type and the hash
+// to be signed all line up.
+//
+// The following conditions are enforced, in order:
+//
+//   - The signer must support the transaction type.
+//   - The chain ID embedded in the transaction must equal the signer's chain
+//     ID. This is the cross-chain replay guard: a signature created for another
+//     chain is never accepted. An unprotected (pre-EIP-155) legacy transaction
+//     carries chain ID zero and is only accepted by a chain-less legacy signer.
+//   - The signing hash derived from the transaction must equal the hash the
+//     signer would sign. This guarantees that the transaction contents and their
+//     encoding (including the EIP-2718 type prefix) are unchanged and that a
+//     signature cannot be moved between transaction types.
+//
+// On success the observed (transaction) and expected (signer) signature
+// domains are returned and are identical. Historical legacy transaction
+// encodings are left untouched by this check; only the signing domain is
+// examined.
+func CheckSignatureDomain(signer Signer, tx *Transaction) (observed, expected SignatureDomain, err error) {
+	txType := tx.Type()
+
+	// The domain the signer asks for. Legacy signers have no chain ID; typed
+	// transactions are always replay-protected by an explicit chain ID.
+	expected = SignatureDomain{
+		ChainID: signer.ChainID(),
+		TxType:  txType,
+	}
+	if expected.ChainID == nil {
+		expected.ChainID = new(big.Int)
+	}
+
+	// The domain the transaction actually commits to. Unprotected legacy
+	// transactions report chain ID zero and are signed over the pre-EIP-155
+	// hash; replay-protected legacy transactions and all typed transactions
+	// bind the signature to a concrete chain ID.
+	observed = SignatureDomain{
+		ChainID: tx.ChainId(),
+		TxType:  txType,
+	}
+	if observed.ChainID == nil {
+		observed.ChainID = new(big.Int)
+	}
+	if txType == LegacyTxType && !tx.Protected() {
+		// Pre-EIP-155 legacy transactions are signed without chain ID and
+		// without the EIP-155 suffix.
+		observed.SignedOn = FrontierSigner{}.Hash(tx)
+	} else {
+		observed.SignedOn = tx.inner.sigHash(observed.ChainID)
+	}
+
+	if !signerSupportsType(signer, txType) {
+		return observed, expected, fmt.Errorf("%w: type %d", ErrSignatureDomainType, txType)
+	}
+	if observed.ChainID.Cmp(expected.ChainID) != 0 {
+		return observed, expected, fmt.Errorf("%w: tx chain id %s, signer chain id %s", ErrSignatureDomainChainID, observed.ChainID, expected.ChainID)
+	}
+
+	// With chain IDs aligned, the signer's hash and the transaction's hash use
+	// the same domain input. Unprotected legacy transactions are the one
+	// exception: a modern signer defers them to the homestead hash, which has
+	// no EIP-155 suffix.
+	if txType == LegacyTxType && !tx.Protected() {
+		expected.SignedOn = FrontierSigner{}.Hash(tx)
+	} else {
+		expected.SignedOn = signer.Hash(tx)
+	}
+	if observed.SignedOn != expected.SignedOn {
+		return observed, expected, fmt.Errorf("%w: tx signed hash %s, signer signing hash %s", ErrSignatureDomainHash, observed.SignedOn.Hex(), expected.SignedOn.Hex())
+	}
+	return observed, expected, nil
+}
 
 // sigCache is used to cache the derived sender and contains
 // the signer used to derive it.

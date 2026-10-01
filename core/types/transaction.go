@@ -634,6 +634,17 @@ func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, e
 	return &Transaction{inner: cpy, time: tx.time}, nil
 }
 
+// CheckSignatureDomain is the entry point for verifying that the transaction's
+// signature domain matches the signer's domain. It reports whether the chain
+// ID, the transaction type and the hash to be signed are all consistent and
+// therefore whether accepting the transaction could lead to a cross-chain
+// replay. See the package-level CheckSignatureDomain documentation for the
+// exact rules. The transaction itself, including the legacy encoding, is not
+// modified.
+func (tx *Transaction) CheckSignatureDomain(signer Signer) (observed, expected SignatureDomain, err error) {
+	return CheckSignatureDomain(signer, tx)
+}
+
 // Transactions implements DerivableList for transactions.
 type Transactions []*Transaction
 
