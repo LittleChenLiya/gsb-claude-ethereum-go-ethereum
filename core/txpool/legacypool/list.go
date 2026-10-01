@@ -303,26 +303,8 @@ func (l *list) Contains(nonce uint64) bool {
 func (l *list) Add(tx *types.Transaction, priceBump uint64) (bool, *types.Transaction) {
 	// If there's an older better transaction, abort
 	old := l.txs.Get(tx.Nonce())
-	if old != nil {
-		if old.GasFeeCapCmp(tx) >= 0 || old.GasTipCapCmp(tx) >= 0 {
-			return false, nil
-		}
-		// thresholdFeeCap = oldFC  * (100 + priceBump) / 100
-		a := big.NewInt(100 + int64(priceBump))
-		aFeeCap := new(big.Int).Mul(a, old.GasFeeCap())
-		aTip := a.Mul(a, old.GasTipCap())
-
-		// thresholdTip    = oldTip * (100 + priceBump) / 100
-		b := big.NewInt(100)
-		thresholdFeeCap := aFeeCap.Div(aFeeCap, b)
-		thresholdTip := aTip.Div(aTip, b)
-
-		// We have to ensure that both the new fee cap and tip are higher than the
-		// old ones as well as checking the percentage threshold to ensure that
-		// this is accurate for low (Wei-level) gas price replacements.
-		if tx.GasFeeCapIntCmp(thresholdFeeCap) < 0 || tx.GasTipCapIntCmp(thresholdTip) < 0 {
-			return false, nil
-		}
+	if old != nil && !l.priceBumpMet(old, tx, priceBump) {
+		return false, nil
 	}
 	// Add new tx cost to totalcost
 	cost, overflow := uint256.FromBig(tx.Cost())
@@ -349,6 +331,32 @@ func (l *list) Add(tx *types.Transaction, priceBump uint64) (bool, *types.Transa
 		l.gascap = gas
 	}
 	return true, old
+}
+
+// priceBumpMet reports whether the new transaction meets the configured price
+// bump requirement over the old one. If old is nil, there is no incumbent and
+// the check passes.
+func (l *list) priceBumpMet(old, tx *types.Transaction, priceBump uint64) bool {
+	if old == nil {
+		return true
+	}
+	if old.GasFeeCapCmp(tx) >= 0 || old.GasTipCapCmp(tx) >= 0 {
+		return false
+	}
+	// thresholdFeeCap = oldFC  * (100 + priceBump) / 100
+	a := big.NewInt(100 + int64(priceBump))
+	aFeeCap := new(big.Int).Mul(a, old.GasFeeCap())
+	aTip := new(big.Int).Mul(a, old.GasTipCap())
+
+	// thresholdTip    = oldTip * (100 + priceBump) / 100
+	b := big.NewInt(100)
+	thresholdFeeCap := aFeeCap.Div(aFeeCap, b)
+	thresholdTip := aTip.Div(aTip, b)
+
+	// We have to ensure that both the new fee cap and tip are higher than the
+	// old ones as well as checking the percentage threshold to ensure that
+	// this is accurate for low (Wei-level) gas price replacements.
+	return tx.GasFeeCapIntCmp(thresholdFeeCap) >= 0 && tx.GasTipCapIntCmp(thresholdTip) >= 0
 }
 
 // Forward removes all transactions from the list with a nonce lower than the
@@ -649,6 +657,83 @@ func (l *pricedList) Discard(slots int) (types.Transactions, bool) {
 		for _, tx := range drop {
 			heap.Push(&l.urgent, tx)
 		}
+		return nil, false
+	}
+	return drop, true
+}
+
+// clone returns an independent copy of the price heap, safe to mutate without
+// affecting the pool.
+func (h *priceHeap) clone() *priceHeap {
+	return &priceHeap{baseFee: h.baseFee, list: slices.Clone(h.list)}
+}
+
+// underpricedReadOnly reports whether a transaction is cheaper than (or as
+// cheap as) the lowest priced tracked transaction, without modifying the pool.
+// It mirrors Underpriced but operates on heap clones, so stale entries are
+// skipped rather than removed.
+func (l *pricedList) underpricedReadOnly(tx *types.Transaction) bool {
+	urgent := l.urgent.clone()
+	floating := l.floating.clone()
+	return (underpricedFor(urgent, l.all, tx) || len(l.urgent.list) == 0) &&
+		(underpricedFor(floating, l.all, tx) || len(l.floating.list) == 0) &&
+		(len(l.urgent.list) != 0 || len(l.floating.list) != 0)
+}
+
+// underpricedFor mirrors the method on pricedList but operates on the given
+// heap and lookup without touching the pool.
+func underpricedFor(h *priceHeap, all *lookup, tx *types.Transaction) bool {
+	// Discard stale price points if found at the heap start
+	for len(h.list) > 0 {
+		head := h.list[0]
+		if all.Get(head.Hash()) == nil { // Removed or migrated
+			heap.Pop(h)
+			continue
+		}
+		break
+	}
+	// Check if the transaction is underpriced or not
+	if len(h.list) == 0 {
+		return false // There is no remote transaction at all.
+	}
+	// If the remote transaction is even cheaper than the
+	// cheapest one tracked locally, reject it.
+	return h.cmp(h.list[0], tx) >= 0
+}
+
+// discardReadOnly reports which transactions would be evicted to make room
+// for the given number of slots, without modifying the pool. It mirrors
+// Discard but operates on heap clones, so the pool state is untouched.
+func (l *pricedList) discardReadOnly(slots int) (types.Transactions, bool) {
+	urgent := l.urgent.clone()
+	floating := l.floating.clone()
+	drop := make(types.Transactions, 0, slots) // Remote underpriced transactions to drop
+	for slots > 0 {
+		if len(urgent.list)*floatingRatio > len(floating.list)*urgentRatio {
+			// Discard stale transactions if found during cleanup
+			tx := heap.Pop(urgent).(*types.Transaction)
+			if l.all.Get(tx.Hash()) == nil { // Removed or migrated
+				continue
+			}
+			// Non stale transaction found, move to floating heap
+			heap.Push(floating, tx)
+		} else {
+			if len(floating.list) == 0 {
+				// Stop if both heaps are empty
+				break
+			}
+			// Discard stale transactions if found during cleanup
+			tx := heap.Pop(floating).(*types.Transaction)
+			if l.all.Get(tx.Hash()) == nil { // Removed or migrated
+				continue
+			}
+			// Non stale transaction found, discard it
+			drop = append(drop, tx)
+			slots -= numSlots(tx)
+		}
+	}
+	// If we still can't make enough room for the new transaction
+	if slots > 0 {
 		return nil, false
 	}
 	return drop, true

@@ -507,3 +507,35 @@ func (p *TxPool) FilterType(kind byte) bool {
 	}
 	return false
 }
+
+// ReplaceReporter is an optional interface implemented by subpools that can
+// report replacement reasons without mutating their state.
+type ReplaceReporter interface {
+	// ReportReplacement runs a read-only validation of whether the candidate
+	// transaction would be accepted by the subpool as a new transaction or as
+	// a replacement, and reports which pool constraint would reject it first.
+	ReportReplacement(tx *types.Transaction) ReplaceReport
+}
+
+// ReportReplacement runs a read-only validation of whether the candidate
+// transaction would be accepted by the pool as a new transaction or as a
+// replacement, and reports which pool constraint would reject it first. It
+// never modifies pool state.
+//
+// The report is delegated to the subpool that handles the transaction type.
+// If no subpool handles the type, or the handling subpool does not support
+// replacement reporting, an error report is returned.
+func (p *TxPool) ReportReplacement(tx *types.Transaction) ReplaceReport {
+	for _, subpool := range p.subpools {
+		if !subpool.Filter(tx) {
+			continue
+		}
+		if reporter, ok := subpool.(ReplaceReporter); ok {
+			return reporter.ReportReplacement(tx)
+		}
+		// The subpool handling this tx type does not support replacement
+		// reporting.
+		return ReplaceReport{Err: ErrOutOfCapacity}
+	}
+	return ReplaceReport{Err: core.ErrTxTypeNotSupported}
+}

@@ -315,3 +315,117 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	}
 	return nil
 }
+
+// ReplaceReason identifies the first pool constraint that would reject a
+// transaction replacement candidate.
+type ReplaceReason uint8
+
+const (
+	// ReplaceAccepted means the candidate would be accepted by the pool,
+	// either as a new transaction or as a replacement.
+	ReplaceAccepted ReplaceReason = iota
+
+	// ReplaceReasonPrice means the candidate is rejected because it does not
+	// meet the configured price bump over the transaction it would replace.
+	ReplaceReasonPrice
+
+	// ReplaceReasonNonce means the candidate is rejected because of nonce
+	// ordering, e.g. a gapped (future) transaction trying to replace a
+	// pending one.
+	ReplaceReasonNonce
+
+	// ReplaceReasonCapacity means the candidate is rejected because the pool
+	// or account has no capacity for it.
+	ReplaceReasonCapacity
+)
+
+// String returns the name of the replacement reason.
+func (r ReplaceReason) String() string {
+	switch r {
+	case ReplaceAccepted:
+		return "accepted"
+	case ReplaceReasonPrice:
+		return "price"
+	case ReplaceReasonNonce:
+		return "nonce"
+	case ReplaceReasonCapacity:
+		return "capacity"
+	default:
+		return "unknown"
+	}
+}
+
+// ReplaceReport is the result of a read-only replacement validation. It
+// describes whether a candidate transaction would be accepted by the pool
+// and, if not, which constraint rejects it first. It never modifies pool
+// state.
+type ReplaceReport struct {
+	// Reason is the first constraint that rejects the candidate, or
+	// ReplaceAccepted if the candidate would be accepted.
+	Reason ReplaceReason
+
+	// Err is the error the pool would return to the caller for the candidate
+	// (nil if it would be accepted). Existing error codes are preserved.
+	Err error
+}
+
+// ReplaceValidationOptions are the pool-provided facts used by
+// ValidateReplacement to decide which constraint rejects a candidate first.
+// Every callback must be safe to invoke without mutating pool state.
+type ReplaceValidationOptions struct {
+	// PoolFull reports whether admitting the candidate would overflow the
+	// pool.
+	PoolFull func(tx *types.Transaction) bool
+
+	// Underpriced reports whether the candidate is cheaper than the worst
+	// pooled transaction. Only consulted when the pool is full.
+	Underpriced func(tx *types.Transaction) bool
+
+	// Throttled reports whether the pool has performed too many evictions
+	// since the last reorg. Only consulted when the pool is full.
+	Throttled func(tx *types.Transaction) bool
+
+	// Evictable reports whether enough underpriced transactions can be
+	// evicted to make room for the candidate. Only consulted when the pool
+	// is full.
+	Evictable func(tx *types.Transaction) bool
+
+	// EvictionReplacesPending reports whether evicting underpriced
+	// transactions would drop a pending transaction while the candidate is
+	// gapped (a future transaction trying to replace a pending one). Only
+	// consulted when the pool is full and eviction is possible.
+	EvictionReplacesPending func(tx *types.Transaction) bool
+
+	// PriceBumpMet reports whether the candidate meets the configured price
+	// bump over the transaction it would replace (pending or queued).
+	PriceBumpMet func(tx *types.Transaction) bool
+}
+
+// ValidateReplacement runs a read-only replacement validation against the
+// given pool facts and returns the first constraint that would reject the
+// candidate, or ReplaceAccepted if it would be accepted.
+//
+// The check order mirrors the pools' admission flow: capacity constraints are
+// evaluated first (underpriced, throttled, eviction, then gapped-nonce),
+// followed by the price-bump requirement. Existing error codes and
+// replacement priorities are preserved by the caller.
+func ValidateReplacement(tx *types.Transaction, opts *ReplaceValidationOptions) ReplaceReason {
+	if opts.PoolFull(tx) {
+		if opts.Underpriced(tx) {
+			return ReplaceReasonCapacity
+		}
+		if opts.Throttled(tx) {
+			return ReplaceReasonCapacity
+		}
+		if !opts.Evictable(tx) {
+			return ReplaceReasonCapacity
+		}
+		if opts.EvictionReplacesPending(tx) {
+			return ReplaceReasonNonce
+		}
+	}
+	if !opts.PriceBumpMet(tx) {
+		return ReplaceReasonPrice
+	}
+	return ReplaceAccepted
+}

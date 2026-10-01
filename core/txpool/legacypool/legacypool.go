@@ -797,6 +797,76 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	return replaced, nil
 }
 
+// ReportReplacement runs a read-only validation of whether the candidate
+// transaction would be accepted by the pool as a new transaction or as a
+// replacement, and reports which pool constraint would reject it first. It
+// never modifies pool state and preserves the existing error codes and
+// replacement priorities.
+//
+// The candidate is assumed to pass basic validation (consensus and stateful
+// checks), as those are enforced separately on the mutating admission path.
+func (pool *LegacyPool) ReportReplacement(tx *types.Transaction) txpool.ReplaceReport {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	from, err := types.Sender(pool.signer, tx)
+	if err != nil {
+		// Without a recoverable sender the replacement constraints cannot be
+		// evaluated; report the failure to the caller.
+		return txpool.ReplaceReport{Err: err}
+	}
+	opts := &txpool.ReplaceValidationOptions{
+		PoolFull: func(tx *types.Transaction) bool {
+			return uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue
+		},
+		Underpriced: func(tx *types.Transaction) bool {
+			return pool.priced.underpricedReadOnly(tx)
+		},
+		Throttled: func(tx *types.Transaction) bool {
+			return pool.changesSinceReorg > int(pool.config.GlobalSlots/4)
+		},
+		Evictable: func(tx *types.Transaction) bool {
+			_, ok := pool.priced.discardReadOnly(pool.all.Slots() - int(pool.config.GlobalSlots+pool.config.GlobalQueue) + numSlots(tx))
+			return ok
+		},
+		EvictionReplacesPending: func(tx *types.Transaction) bool {
+			if !pool.isGapped(from, tx) {
+				return false
+			}
+			drop, _ := pool.priced.discardReadOnly(pool.all.Slots() - int(pool.config.GlobalSlots+pool.config.GlobalQueue) + numSlots(tx))
+			for _, dropTx := range drop {
+				dropSender, _ := types.Sender(pool.signer, dropTx)
+				if list := pool.pending[dropSender]; list != nil && list.Contains(dropTx.Nonce()) {
+					return true
+				}
+			}
+			return false
+		},
+		PriceBumpMet: func(tx *types.Transaction) bool {
+			if list := pool.pending[from]; list != nil && list.Contains(tx.Nonce()) {
+				old := list.txs.Get(tx.Nonce())
+				return list.priceBumpMet(old, tx, pool.config.PriceBump)
+			}
+			return pool.queue.priceBumpMet(tx)
+		},
+	}
+	reason := txpool.ValidateReplacement(tx, opts)
+	report := txpool.ReplaceReport{Reason: reason}
+	switch reason {
+	case txpool.ReplaceReasonPrice:
+		report.Err = txpool.ErrReplaceUnderpriced
+	case txpool.ReplaceReasonNonce:
+		report.Err = ErrFutureReplacePending
+	case txpool.ReplaceReasonCapacity:
+		if pool.priced.underpricedReadOnly(tx) {
+			report.Err = txpool.ErrUnderpriced
+		} else {
+			report.Err = ErrTxPoolOverflow
+		}
+	}
+	return report
+}
+
 // isGapped reports whether the given transaction is immediately executable.
 func (pool *LegacyPool) isGapped(from common.Address, tx *types.Transaction) bool {
 	// Short circuit if transaction falls within the scope of the pending list

@@ -151,6 +151,19 @@ func (q *queue) add(tx *types.Transaction) (*common.Hash, error) {
 	return &h, nil
 }
 
+// priceBumpMet reports whether the candidate transaction meets the configured
+// price bump requirement over a queued transaction with the same nonce. It is
+// read-only and does not modify the queue.
+func (q *queue) priceBumpMet(tx *types.Transaction) bool {
+	from, _ := types.Sender(q.signer, tx) // already validated
+	list := q.queued[from]
+	if list == nil {
+		return true
+	}
+	old := list.txs.Get(tx.Nonce())
+	return list.priceBumpMet(old, tx, q.config.PriceBump)
+}
+
 // promoteExecutables iterates over all accounts with queued transactions, selecting
 // for promotion any that are now executable. It also drops any transactions that are
 // deemed too old (nonce too low) or too costly (insufficient funds or over gas limit).
