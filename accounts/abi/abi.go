@@ -113,6 +113,19 @@ func (abi ABI) Unpack(name string, data []byte) ([]interface{}, error) {
 	return args.Unpack(data)
 }
 
+// UnpackWithRemainder unpacks the output according to the abi specification
+// and returns the number of bytes in data that were not consumed while
+// decoding. ABI encodings are self-describing with respect to their length, so
+// the remainder can be used to detect trailing data that was not part of the
+// encoding. The returned values are identical to those returned by Unpack.
+func (abi ABI) UnpackWithRemainder(name string, data []byte) ([]interface{}, int, error) {
+	args, err := abi.getArguments(name, data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return args.UnpackWithRemainder(data)
+}
+
 // UnpackIntoInterface unpacks the output in v according to the abi specification.
 // It performs an additional copy. Please only use, if you want to unpack into a
 // structure that does not strictly conform to the abi structure (e.g. has additional arguments)

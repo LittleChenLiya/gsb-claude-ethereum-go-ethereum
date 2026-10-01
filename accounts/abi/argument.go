@@ -178,6 +178,26 @@ func (arguments Arguments) copyTuple(v any, marshalledValues []any) error {
 	return nil
 }
 
+// UnpackWithRemainder performs the operation hexdata -> Go format and returns
+// the number of bytes in data that were not consumed while decoding the
+// arguments. ABI encodings are self-describing with respect to their length,
+// so the remainder can be used to detect trailing data that was not part of
+// the encoding. The returned values are identical to those returned by Unpack.
+func (arguments Arguments) UnpackWithRemainder(data []byte) ([]any, int, error) {
+	values, err := arguments.Unpack(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	consumed, err := arguments.consumed(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	if consumed > len(data) {
+		return nil, 0, fmt.Errorf("abi: consumed %d bytes while decoding %d bytes", consumed, len(data))
+	}
+	return values, len(data) - consumed, nil
+}
+
 // UnpackValues can be used to unpack ABI-encoded hexdata according to the ABI-specification,
 // without supplying a struct to unpack into. Instead, this method returns a list containing the
 // values. An atomic argument will be a list with one element.
