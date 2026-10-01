@@ -797,6 +797,83 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	return replaced, nil
 }
 
+// CheckReplacement evaluates, without modifying the pool in any way, whether
+// the given transaction would currently be accepted as a replacement for an
+// already pooled transaction (or as a fresh entry). The returned report names
+// the first rule that would reject it - nonce/state, pool capacity or the
+// replacement price bump - together with the exact sentinel error the real
+// insertion path (add) would return.
+//
+// Basic, stateless consensus validation (ValidateTxBasics) is run exactly as
+// during a real insertion; its errors are returned directly. The method only
+// observes pool state through read-only checks, so no transaction is inserted,
+// evicted or reordered and no internal counters are advanced.
+func (pool *LegacyPool) CheckReplacement(tx *types.Transaction) (*txpool.ReplacementReport, error) {
+	// If the transaction is already known, discard it the same way add does.
+	if pool.all.Get(tx.Hash()) != nil {
+		return nil, txpool.ErrAlreadyKnown
+	}
+	// Basic stateless validation, identical to the Add() fast path.
+	if err := pool.ValidateTxBasics(tx); err != nil {
+		return nil, err
+	}
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	from, _ := types.Sender(pool.signer, tx) // already validated by ValidateTxBasics
+
+	// Locate the transaction this candidate replaces, if any, mirroring add():
+	// a pending tx takes precedence, otherwise look in the future queue.
+	var existing *types.Transaction
+	if list := pool.pending[from]; list != nil {
+		existing = list.txs.Get(tx.Nonce())
+	}
+	if existing == nil {
+		if list, ok := pool.queue.get(from); ok {
+			existing = list.txs.Get(tx.Nonce())
+		}
+	}
+
+	opts := &txpool.ReplacementOptions{
+		PriceBump: pool.config.PriceBump,
+		Existing:  existing,
+		// Stateful validation (nonce, balance), identical to the add() path.
+		ValidateWithState: pool.validateTx,
+		// Capacity check, reproducing the overflow section of add() without
+		// discarding anything.
+		HasCapacity: func(tx *types.Transaction) error {
+			if uint64(pool.all.Slots()+numSlots(tx)) <= pool.config.GlobalSlots+pool.config.GlobalQueue {
+				return nil
+			}
+			// Pool is full: an underpriced candidate cannot evict anything.
+			if pool.priced.UnderpricedSim(tx) {
+				return txpool.ErrUnderpriced
+			}
+			// Cap the number of replacements between reorg runs.
+			if pool.changesSinceReorg > int(pool.config.GlobalSlots/4) {
+				return ErrTxPoolOverflow
+			}
+			// See whether enough underpriced remote transactions could be freed.
+			need := pool.all.Slots() - int(pool.config.GlobalSlots+pool.config.GlobalQueue) + numSlots(tx)
+			drop, success := pool.priced.DiscardSim(need)
+			if !success {
+				return ErrTxPoolOverflow
+			}
+			// A gapped (future) transaction must never churn pending ones.
+			if pool.isGapped(from, tx) {
+				for _, dropTx := range drop {
+					dropSender, _ := types.Sender(pool.signer, dropTx)
+					if list := pool.pending[dropSender]; list != nil && list.Contains(dropTx.Nonce()) {
+						return ErrFutureReplacePending
+					}
+				}
+			}
+			return nil
+		},
+	}
+	return txpool.EvaluateReplacement(tx, opts), nil
+}
+
 // isGapped reports whether the given transaction is immediately executable.
 func (pool *LegacyPool) isGapped(from common.Address, tx *types.Transaction) bool {
 	// Short circuit if transaction falls within the scope of the pending list

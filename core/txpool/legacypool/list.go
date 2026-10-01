@@ -654,6 +654,84 @@ func (l *pricedList) Discard(slots int) (types.Transactions, bool) {
 	return drop, true
 }
 
+// snapshot returns a shallow copy of the urgent and floating heaps. The
+// underlying transaction pointers are shared (they are never modified), but the
+// slice backing arrays and heap state are independent, allowing read-only
+// eviction simulations to pop/push without touching the live pool.
+func (l *pricedList) snapshot() (urgent, floating priceHeap) {
+	urgent.baseFee, floating.baseFee = l.urgent.baseFee, l.floating.baseFee
+	urgent.list = append([]*types.Transaction(nil), l.urgent.list...)
+	floating.list = append([]*types.Transaction(nil), l.floating.list...)
+	return urgent, floating
+}
+
+// underpricedSim is the read-only counterpart of underpricedFor: stale heads
+// are popped from the copied heap only, never from the live pool.
+func (l *pricedList) underpricedSim(h *priceHeap, tx *types.Transaction) bool {
+	for len(h.list) > 0 {
+		head := h.list[0]
+		if l.all.Get(head.Hash()) == nil { // Removed or migrated
+			heap.Pop(h)
+			continue
+		}
+		break
+	}
+	if len(h.list) == 0 {
+		return false // There is no remote transaction at all.
+	}
+	// If the remote transaction is even cheaper than the
+	// cheapest one tracked locally, reject it.
+	return h.cmp(h.list[0], tx) >= 0
+}
+
+// UnderpricedSim is the read-only counterpart of Underpriced. It reports
+// whether tx would be considered underpriced without mutating the live heaps.
+func (l *pricedList) UnderpricedSim(tx *types.Transaction) bool {
+	urgent, floating := l.snapshot()
+	return (l.underpricedSim(&urgent, tx) || len(urgent.list) == 0) &&
+		(l.underpricedSim(&floating, tx) || len(floating.list) == 0) &&
+		(len(urgent.list) != 0 || len(floating.list) != 0)
+}
+
+// DiscardSim is the read-only counterpart of Discard. It simulates freeing the
+// requested number of slots from the priced heaps and returns the transactions
+// that would be dropped, together with whether enough room could be made. The
+// live pool (heaps, counters and tracked transactions) is never modified; on a
+// failed simulation the copied heaps are simply discarded.
+func (l *pricedList) DiscardSim(slots int) (types.Transactions, bool) {
+	drop := make(types.Transactions, 0, slots) // Simulated remote underpriced transactions
+	urgent, floating := l.snapshot()
+	for slots > 0 {
+		if len(urgent.list)*floatingRatio > len(floating.list)*urgentRatio {
+			if len(urgent.list) == 0 {
+				return nil, false
+			}
+			tx := heap.Pop(&urgent).(*types.Transaction)
+			if l.all.Get(tx.Hash()) == nil { // Removed or migrated
+				continue
+			}
+			// Non stale transaction found, move to floating heap
+			heap.Push(&floating, tx)
+		} else {
+			if len(floating.list) == 0 {
+				// Stop if both heaps are empty
+				return nil, false
+			}
+			tx := heap.Pop(&floating).(*types.Transaction)
+			if l.all.Get(tx.Hash()) == nil { // Removed or migrated
+				continue
+			}
+			// Non stale transaction found, discard it
+			drop = append(drop, tx)
+			slots -= numSlots(tx)
+		}
+	}
+	if slots > 0 {
+		return nil, false
+	}
+	return drop, true
+}
+
 // Reheap forcibly rebuilds the heap based on the current remote transaction set.
 func (l *pricedList) Reheap() {
 	l.reheapMu.Lock()

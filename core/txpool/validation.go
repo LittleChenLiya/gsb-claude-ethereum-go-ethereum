@@ -259,6 +259,168 @@ type ValidationOptionsWithState struct {
 	ExistingCost func(addr common.Address, nonce uint64) *big.Int
 }
 
+// ReplacementRejectReason identifies which rule of a replacement attempt is the
+// first one that would refuse the new transaction. The values follow the exact
+// ordering in which the pools evaluate a replacement candidate.
+type ReplacementRejectReason int
+
+const (
+	// ReplacementRejectedNonce reports that the nonce check is the first rule
+	// that rejects the candidate (e.g. the nonce is already consumed, or it
+	// creates a forbidden gap in pools that disallow them).
+	ReplacementRejectedNonce ReplacementRejectReason = iota
+
+	// ReplacementRejectedCapacity reports that the capacity/balance check is the
+	// first rule that rejects the candidate (e.g. the pool is full and the
+	// candidate is too cheap to evict anything, or the sender cannot afford it).
+	ReplacementRejectedCapacity
+
+	// ReplacementRejectedPrice reports that the replacement price bump check is
+	// the first rule that rejects the candidate (ErrReplaceUnderpriced).
+	ReplacementRejectedPrice
+)
+
+// String returns a human readable identifier for the rejection reason.
+func (r ReplacementRejectReason) String() string {
+	switch r {
+	case ReplacementRejectedNonce:
+		return "nonce"
+	case ReplacementRejectedCapacity:
+		return "capacity"
+	case ReplacementRejectedPrice:
+		return "price"
+	default:
+		return "unknown"
+	}
+}
+
+// ReplacementOptions carries the read-only callbacks a pool provides to
+// EvaluateReplacement. None of the callbacks may mutate pool state; they only
+// observe the same data the pool consults when it really inserts a transaction.
+type ReplacementOptions struct {
+	// PriceBump is the minimum percentage (e.g. 10 for 10%) by which the new
+	// transaction must beat the already pooled one with the same nonce.
+	PriceBump uint64
+
+	// Existing is the transaction already pooled for the candidate's nonce, or
+	// nil if the candidate does not replace anything.
+	Existing *types.Transaction
+
+	// ValidateWithState, if set, runs the pool's state-dependent validation
+	// (nonce ordering, nonce gaps, balances and per-account capacity). It must
+	// be the same read-only check the pool runs before its price-bump check.
+	ValidateWithState func(tx *types.Transaction) error
+
+	// HasCapacity, if set, reports whether the pool has enough capacity for the
+	// candidate or could free it by eviction. It is evaluated only when the
+	// state validation above passes and must not evict or insert anything. A
+	// non-nil error is the exact capacity error the real insertion path would
+	// return (e.g. ErrUnderpriced or an "out of capacity" style sentinel).
+	HasCapacity func(tx *types.Transaction) error
+}
+
+// ReplacementReport is the read-only outcome of evaluating a replacement
+// candidate. It describes what a real insertion attempt would do without
+// touching pool state: if Accepted is false, Reason names the first rule that
+// rejects the candidate and Err is the exact sentinel error that the pool's
+// insertion path would return.
+type ReplacementReport struct {
+	// Accepted reports whether a real insertion of the candidate would pass
+	// every replacement check.
+	Accepted bool
+
+	// Reason names the first rule that rejects the candidate. It is only
+	// meaningful when Accepted is false.
+	Reason ReplacementRejectReason
+
+	// Err is the sentinel error the pool would return for a rejected
+	// candidate. It is nil when the candidate is accepted.
+	Err error
+}
+
+// EvaluateReplacement runs the replacement checks for a candidate transaction
+// against the read-only observations supplied through opts and returns a
+// ReplacementReport. It never mutates pool state and it does not perform the
+// basic, stateless consensus validation (callers run that separately, exactly
+// as the insertion path does).
+//
+// The checks are evaluated in the same order as the pools evaluate them during
+// a real insertion, so Reason reports the first rule that would reject the
+// candidate: nonce/state validation first, then capacity, finally the
+// replacement price bump.
+func EvaluateReplacement(tx *types.Transaction, opts *ReplacementOptions) *ReplacementReport {
+	// 1. Nonce/state-dependent validation. The pools perform this before any
+	// capacity or price-bump handling, and it is where stale nonces, nonce gaps
+	// and unaffordable transactions are rejected.
+	if opts.ValidateWithState != nil {
+		if err := opts.ValidateWithState(tx); err != nil {
+			return &ReplacementReport{Reason: classifyReplacementError(err), Err: err}
+		}
+	}
+	// 2. Capacity. This mirrors the pool-wide overflow/eviction check the pools
+	// run before attempting the price-bump replacement.
+	if opts.HasCapacity != nil {
+		if err := opts.HasCapacity(tx); err != nil {
+			return &ReplacementReport{Reason: ReplacementRejectedCapacity, Err: err}
+		}
+	}
+	// 3. Replacement price bump, evaluated only when a transaction with the
+	// same nonce is already pooled.
+	if opts.Existing != nil {
+		if err := ValidateReplacementPrice(opts.Existing, tx, opts.PriceBump); err != nil {
+			return &ReplacementReport{Reason: ReplacementRejectedPrice, Err: err}
+		}
+	}
+	return &ReplacementReport{Accepted: true}
+}
+
+// classifyReplacementError maps a state-validation error to the replacement
+// rule that produced it. A nonce ordering problem (stale nonce or forbidden
+// gap) is attributed to the nonce rule; balance overdrafts and per-account
+// slot limits are account-level capacity problems.
+func classifyReplacementError(err error) ReplacementRejectReason {
+	switch {
+	case errors.Is(err, core.ErrNonceTooLow), errors.Is(err, core.ErrNonceTooHigh):
+		return ReplacementRejectedNonce
+	case errors.Is(err, ErrAccountLimitExceeded),
+		errors.Is(err, ErrInflightTxLimitReached),
+		errors.Is(err, core.ErrInsufficientFunds):
+		return ReplacementRejectedCapacity
+	default:
+		// Any other state-validation failure originates from the
+		// state-dependent check, which is evaluated before pool capacity and
+		// price and is rooted in nonce/state ordering.
+		return ReplacementRejectedNonce
+	}
+}
+
+// ValidateReplacementPrice checks whether newTx would be allowed to replace
+// oldTx based purely on the required price bump. It is a read-only, pure
+// function and returns ErrReplaceUnderpriced when the bump is insufficient.
+//
+// The rules are identical to the ones the legacy pool applies when inserting a
+// replacement: both the fee cap and the tip of the new transaction must be
+// strictly higher, and each must reach old*(100+priceBump)/100 (the threshold
+// comparison is what makes 1-Wei replacements behave correctly).
+func ValidateReplacementPrice(oldTx, newTx *types.Transaction, priceBump uint64) error {
+	// If the new transaction does not strictly beat the old one, abort.
+	if oldTx.GasFeeCapCmp(newTx) >= 0 || oldTx.GasTipCapCmp(newTx) >= 0 {
+		return ErrReplaceUnderpriced
+	}
+	// threshold = old * (100 + priceBump) / 100, computed independently for the
+	// fee cap and the tip (each value is divided by 100, hence two denominators).
+	bump := big.NewInt(100 + int64(priceBump))
+	hundred := big.NewInt(100)
+
+	thresholdFeeCap := new(big.Int).Div(new(big.Int).Mul(bump, oldTx.GasFeeCap()), hundred)
+	thresholdTip := new(big.Int).Div(new(big.Int).Mul(bump, oldTx.GasTipCap()), hundred)
+
+	if newTx.GasFeeCapIntCmp(thresholdFeeCap) < 0 || newTx.GasTipCapIntCmp(thresholdTip) < 0 {
+		return ErrReplaceUnderpriced
+	}
+	return nil
+}
+
 // ValidateTransactionWithState is a helper method to check whether a transaction
 // is valid according to the pool's internal state checks (balance, nonce, gaps).
 //
